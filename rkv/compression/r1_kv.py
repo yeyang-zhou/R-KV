@@ -36,6 +36,8 @@ class R1KV:
         # request-local Q tensors but does not know R-KV's window semantics.
         self._serving_query_rings = {}
         self._serving_query_counts = {}
+        self._serving_layer_order = None
+        self._pending_serving_queries = {}
 
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
@@ -166,16 +168,7 @@ class R1KV:
         )
         return final_score, attn_weights
 
-    def observe_query(self, layer_name, query):
-        """Record the request-local Q state R-KV needs for its next decision."""
-        if query.ndim != 3 or query.shape[0] == 0:
-            raise ValueError(
-                "R-KV observation expects [tokens, q_heads, head_dim]"
-            )
-
-        # R-KV scores one decode-frontier query per observation step. Keep
-        # the ring here so serving runtimes never depend on window_size.
-        frontier_query = query[-1]
+    def _query_ring(self, layer_name, frontier_query):
         ring = self._serving_query_rings.get(layer_name)
         if (
             ring is None
@@ -187,10 +180,54 @@ class R1KV:
             )
             self._serving_query_rings[layer_name] = ring
             self._serving_query_counts[layer_name] = 0
+        return ring
 
-        count = self._serving_query_counts[layer_name]
-        ring[count % self.window_size].copy_(frontier_query)
-        self._serving_query_counts[layer_name] = count + 1
+    def _flush_pending_serving_queries(self):
+        if not self._pending_serving_queries:
+            return
+        if self._serving_layer_order is None:
+            raise RuntimeError("R-KV query batching requires known serving layers")
+        if set(self._pending_serving_queries) != set(self._serving_layer_order):
+            raise RuntimeError("R-KV received an incomplete serving query layer set")
+
+        destinations = []
+        sources = []
+        for layer_name in self._serving_layer_order:
+            frontier_query = self._pending_serving_queries[layer_name]
+            ring = self._query_ring(layer_name, frontier_query)
+            count = self._serving_query_counts[layer_name]
+            destinations.append(ring[count % self.window_size])
+            sources.append(frontier_query)
+
+        torch._foreach_copy_(destinations, sources)
+        for layer_name in self._serving_layer_order:
+            self._serving_query_counts[layer_name] += 1
+        self._pending_serving_queries.clear()
+
+    def observe_query(self, layer_name, query):
+        """Record the request-local Q state R-KV needs for its next decision."""
+        if query.ndim != 3 or query.shape[0] == 0:
+            raise ValueError(
+                "R-KV observation expects [tokens, q_heads, head_dim]"
+            )
+
+        frontier_query = query[-1]
+        if self._serving_layer_order is None:
+            ring = self._query_ring(layer_name, frontier_query)
+            count = self._serving_query_counts[layer_name]
+            ring[count % self.window_size].copy_(frontier_query)
+            self._serving_query_counts[layer_name] = count + 1
+            return
+
+        if layer_name not in self._serving_layer_order:
+            raise RuntimeError(f"Unexpected R-KV serving layer {layer_name!r}")
+        if layer_name in self._pending_serving_queries:
+            raise RuntimeError(
+                f"Duplicate R-KV query observation for layer {layer_name!r}"
+            )
+        self._pending_serving_queries[layer_name] = frontier_query
+        if len(self._pending_serving_queries) == len(self._serving_layer_order):
+            self._flush_pending_serving_queries()
 
     def _serving_query_window(self, layer_name):
         count = self._serving_query_counts.get(layer_name, 0)
@@ -215,6 +252,12 @@ class R1KV:
         """Return one ordered retained-position set shared by all KV layers."""
         if not layer_key_states:
             raise ValueError("R-KV selection requires non-empty layer inputs")
+
+        layer_order = tuple(layer_key_states)
+        if self._serving_layer_order is None:
+            self._serving_layer_order = layer_order
+        elif layer_order != self._serving_layer_order:
+            raise RuntimeError("R-KV serving layer order changed across compactions")
 
         shared_scores = None
         kv_cache_len = None
