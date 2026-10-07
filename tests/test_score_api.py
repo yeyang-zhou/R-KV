@@ -1,8 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
-
-from rkv import R1KV, build_r1kv_serving_algorithm
+from rkv import R1KV
 from rkv.utils import cal_similarity, compute_attention_scores
 
 
@@ -222,18 +221,6 @@ def test_should_compact_owns_rkv_trigger_and_readiness():
         num_new_tokens=1,
         is_genuine_decode=False,
     )
-
-
-def test_plugin_entry_point_factory_is_owned_by_rkv_package():
-    algorithm = build_r1kv_serving_algorithm(
-        {
-            "budget": 32,
-            "buffer": 16,
-        }
-    )
-    assert isinstance(algorithm, R1KV)
-    assert algorithm.budget == 32
-    assert algorithm.buffer == 16
 
 
 def test_existing_positional_constructor_binding_is_unchanged():
