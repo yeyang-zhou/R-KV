@@ -1,4 +1,4 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,11 @@ class R1KV:
 
         if self.buffer < self.window_size:
             raise ValueError("buffer must be >= window_size")
+
+        # Serving-only query history stays inside R-KV. The runtime forwards
+        # request-local Q tensors but does not know R-KV's window semantics.
+        self._serving_query_rings = {}
+        self._serving_query_counts = {}
 
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
@@ -161,49 +166,69 @@ class R1KV:
         )
         return final_score, attn_weights
 
-    def score_kv(
-        self,
-        key_states,
-        query_states,
-    ):
-        """Return R-KV scores for past KV tokens without selecting or gathering."""
-        final_score, _ = self._compute_scores(key_states, query_states)
-        return final_score
+    def observe_query(self, layer_name, query):
+        """Record the request-local Q state R-KV needs for its next decision."""
+        if query.ndim != 3 or query.shape[0] == 0:
+            raise ValueError(
+                "R-KV observation expects [tokens, q_heads, head_dim]"
+            )
 
-    @property
-    def observation_window_tokens(self) -> int:
-        """Number of recent decode queries required for one R-KV decision."""
-        return self.window_size
+        # R-KV scores one decode-frontier query per observation step. Keeping
+        # the ring here prevents serving runtimes from depending on window_size.
+        frontier_query = query[-1]
+        ring = self._serving_query_rings.get(layer_name)
+        if (
+            ring is None
+            or ring.shape[1] != frontier_query.shape[0]
+            or ring.shape[2] != frontier_query.shape[1]
+        ):
+            ring = frontier_query.new_empty(
+                (self.window_size, frontier_query.shape[0], frontier_query.shape[1])
+            )
+            self._serving_query_rings[layer_name] = ring
+            self._serving_query_counts[layer_name] = 0
+
+        count = self._serving_query_counts[layer_name]
+        ring[count % self.window_size].copy_(frontier_query)
+        self._serving_query_counts[layer_name] = count + 1
+
+    def _serving_query_window(self, layer_name):
+        count = self._serving_query_counts.get(layer_name, 0)
+        if count < self.window_size:
+            raise RuntimeError(
+                f"R-KV does not have a full query window for {layer_name!r}"
+            )
+
+        ring = self._serving_query_rings[layer_name]
+        cursor = count % self.window_size
+        ordered = (
+            ring
+            if cursor == 0
+            else torch.cat((ring[cursor:], ring[:cursor]), dim=0)
+        )
+        return ordered.permute(1, 0, 2).unsqueeze(0).contiguous()
 
     def select_kept_positions(
         self,
-        layer_key_states: Sequence[torch.Tensor],
-        layer_query_states: Sequence[torch.Tensor],
+        layer_key_states: Mapping[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Return one ordered retained-position set shared by all KV layers.
-
-        Serving uses one physical token layout across layers, so R-KV owns the
-        cross-head reduction, cross-layer reduction, and final retention policy.
-        Inputs are per-layer tensors for one request.
-        """
-        if not layer_key_states or len(layer_key_states) != len(layer_query_states):
-            raise ValueError("R-KV selection requires matching non-empty layer inputs")
+        """Return one ordered retained-position set shared by all KV layers."""
+        if not layer_key_states:
+            raise ValueError("R-KV selection requires non-empty layer inputs")
 
         shared_scores = None
         kv_cache_len = None
-        for key_states, query_states in zip(
-            layer_key_states, layer_query_states, strict=True
-        ):
-            if key_states.ndim != 4 or query_states.ndim != 4:
-                raise ValueError("R-KV selection expects batched K/Q tensors")
-            if key_states.shape[0] != 1 or query_states.shape[0] != 1:
-                raise ValueError("R-KV serving selection expects one request")
+        for layer_name, key_states in layer_key_states.items():
+            query_states = self._serving_query_window(layer_name)
+            if key_states.ndim != 4 or key_states.shape[0] != 1:
+                raise ValueError("R-KV serving selection expects one batched request")
             if kv_cache_len is None:
                 kv_cache_len = int(key_states.shape[-2])
             elif int(key_states.shape[-2]) != kv_cache_len:
                 raise ValueError("R-KV selection requires one shared KV length")
 
-            layer_score = self.score_kv(key_states, query_states).mean(dim=1)[0]
+            layer_score, _ = self._compute_scores(key_states, query_states)
+            layer_score = layer_score.mean(dim=1)[0]
             shared_scores = (
                 layer_score if shared_scores is None else shared_scores + layer_score
             )
@@ -260,11 +285,10 @@ class R1KV:
         num_decoded_tokens,
         num_new_tokens,
         is_genuine_decode,
-        query_window_tokens,
     ):
         if not is_genuine_decode or num_new_tokens <= 0:
             return False
-        if query_window_tokens < self.window_size:
+        if min(self._serving_query_counts.values(), default=0) < self.window_size:
             return False
         if resident_len < self.budget + self.buffer:
             return False
