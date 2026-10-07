@@ -215,7 +215,6 @@ class R1KV:
         self._pending_serving_queries.clear()
 
     def _serving_query_window(self, layer_name):
-        self._flush_serving_queries()
         count = self._serving_query_counts.get(layer_name, 0)
         if count < self.window_size:
             raise RuntimeError(
@@ -236,6 +235,7 @@ class R1KV:
         layer_key_states: Mapping[str, torch.Tensor],
     ) -> torch.Tensor:
         """Return one ordered retained-position set shared by all KV layers."""
+        self._flush_serving_queries()
         if not layer_key_states:
             raise ValueError("R-KV selection requires non-empty layer inputs")
 
