@@ -173,9 +173,9 @@ class R1KV:
             )
 
         # R-KV scores one decode-frontier query per observation step. Keep
-        # bounded views here; materialize the ordered window only when scoring.
+        # bounded copies here; materialize the ordered window only when scoring.
         history = self._serving_query_history.setdefault(layer_name, [])
-        history.append(query[-1:])
+        history.append(query[-1:].clone())
         if len(history) > self.window_size:
             del history[:-self.window_size]
 
