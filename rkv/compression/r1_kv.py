@@ -288,7 +288,20 @@ class R1KV:
     ):
         if not is_genuine_decode or num_new_tokens <= 0:
             return False
-        if min(self._serving_query_counts.values(), default=0) < self.window_size:
+
+        # Serving asks before the model forward. Count the observation that
+        # this step will contribute without exposing R-KV readiness to callers.
+        observed_after_step = min(
+            self._serving_query_counts.values(),
+            default=0,
+        ) + int(
+            self.should_observe_query(
+                num_decoded_tokens=num_decoded_tokens,
+                num_new_tokens=num_new_tokens,
+                is_genuine_decode=is_genuine_decode,
+            )
+        )
+        if observed_after_step < self.window_size:
             return False
         if resident_len < self.budget + self.buffer:
             return False

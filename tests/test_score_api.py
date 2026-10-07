@@ -204,9 +204,11 @@ def test_should_compact_owns_rkv_trigger_and_readiness():
     }
 
     assert not policy.should_compact(num_decoded_tokens=128, **common)
-    for _ in range(policy.window_size):
+    for _ in range(policy.window_size - 1):
         policy.observe_query("layer", torch.randn(1, 4, 8))
 
+    # Planning happens before the forward; the boundary step will contribute
+    # the final observation needed by the R-KV window.
     assert not policy.should_compact(num_decoded_tokens=127, **common)
     assert policy.should_compact(num_decoded_tokens=128, **common)
     assert not policy.should_compact(
