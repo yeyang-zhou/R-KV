@@ -36,7 +36,6 @@ class R1KV:
         # request-local Q tensors but does not know R-KV's window semantics.
         self._serving_query_rings = {}
         self._serving_query_counts = {}
-        self._pending_serving_queries = {}
 
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
@@ -174,45 +173,24 @@ class R1KV:
                 "R-KV observation expects [tokens, q_heads, head_dim]"
             )
 
-        # Delay tiny per-layer copies until the request step is complete so
-        # R-KV can batch them without exposing query-history policy to LMCache.
-        if layer_name in self._pending_serving_queries:
-            self._flush_serving_queries()
-        self._pending_serving_queries[layer_name] = query[-1]
+        # R-KV scores one decode-frontier query per observation step. Keep
+        # the ring here so serving runtimes never depend on window_size.
+        frontier_query = query[-1]
+        ring = self._serving_query_rings.get(layer_name)
+        if (
+            ring is None
+            or ring.shape[1] != frontier_query.shape[0]
+            or ring.shape[2] != frontier_query.shape[1]
+        ):
+            ring = frontier_query.new_empty(
+                (self.window_size, frontier_query.shape[0], frontier_query.shape[1])
+            )
+            self._serving_query_rings[layer_name] = ring
+            self._serving_query_counts[layer_name] = 0
 
-    def _flush_serving_queries(self):
-        if not self._pending_serving_queries:
-            return
-
-        destinations = []
-        sources = []
-        observed_layers = []
-        for layer_name, frontier_query in self._pending_serving_queries.items():
-            ring = self._serving_query_rings.get(layer_name)
-            if (
-                ring is None
-                or ring.shape[1] != frontier_query.shape[0]
-                or ring.shape[2] != frontier_query.shape[1]
-            ):
-                ring = frontier_query.new_empty(
-                    (
-                        self.window_size,
-                        frontier_query.shape[0],
-                        frontier_query.shape[1],
-                    )
-                )
-                self._serving_query_rings[layer_name] = ring
-                self._serving_query_counts[layer_name] = 0
-
-            count = self._serving_query_counts[layer_name]
-            destinations.append(ring[count % self.window_size])
-            sources.append(frontier_query)
-            observed_layers.append(layer_name)
-
-        torch._foreach_copy_(destinations, sources)
-        for layer_name in observed_layers:
-            self._serving_query_counts[layer_name] += 1
-        self._pending_serving_queries.clear()
+        count = self._serving_query_counts[layer_name]
+        ring[count % self.window_size].copy_(frontier_query)
+        self._serving_query_counts[layer_name] = count + 1
 
     def _serving_query_window(self, layer_name):
         count = self._serving_query_counts.get(layer_name, 0)
@@ -235,7 +213,6 @@ class R1KV:
         layer_key_states: Mapping[str, torch.Tensor],
     ) -> torch.Tensor:
         """Return one ordered retained-position set shared by all KV layers."""
-        self._flush_serving_queries()
         if not layer_key_states:
             raise ValueError("R-KV selection requires non-empty layer inputs")
 
@@ -309,7 +286,6 @@ class R1KV:
         num_new_tokens,
         is_genuine_decode,
     ):
-        self._flush_serving_queries()
         if not is_genuine_decode or num_new_tokens <= 0:
             return False
         if min(self._serving_query_counts.values(), default=0) < self.window_size:
