@@ -34,8 +34,7 @@ class R1KV:
 
         # Serving-only query history stays inside R-KV. The runtime forwards
         # request-local Q tensors but does not know R-KV's window semantics.
-        self._serving_query_rings = {}
-        self._serving_query_counts = {}
+        self._serving_query_history = []
         self._serving_layer_order = None
 
         # for recording kept token indices
@@ -167,22 +166,8 @@ class R1KV:
         )
         return final_score, attn_weights
 
-    def _query_ring(self, layer_name, frontier_query):
-        ring = self._serving_query_rings.get(layer_name)
-        if (
-            ring is None
-            or ring.shape[1] != frontier_query.shape[0]
-            or ring.shape[2] != frontier_query.shape[1]
-        ):
-            ring = frontier_query.new_empty(
-                (self.window_size, frontier_query.shape[0], frontier_query.shape[1])
-            )
-            self._serving_query_rings[layer_name] = ring
-            self._serving_query_counts[layer_name] = 0
-        return ring
-
     def observe_query(self, layer_queries: Mapping[str, torch.Tensor]):
-        """Record one request step of Q state for all serving layers."""
+        """Retain one request step of Q state for all serving layers."""
         if not layer_queries:
             raise ValueError("R-KV observation requires non-empty layer inputs")
 
@@ -192,39 +177,45 @@ class R1KV:
         elif layer_order != self._serving_layer_order:
             raise RuntimeError("R-KV serving layer order changed across observations")
 
-        destinations = []
-        sources = []
-        for layer_name, query in layer_queries.items():
+        step_queries = []
+        for query in layer_queries.values():
             if query.ndim != 3 or query.shape[0] == 0:
                 raise ValueError(
                     "R-KV observation expects [tokens, q_heads, head_dim]"
                 )
+            # LMCache forwards materialized request-local observations. Retain
+            # the frontier view and materialize the scoring window only when
+            # compaction actually needs it.
+            step_queries.append(query[-1])
 
-            frontier_query = query[-1]
-            ring = self._query_ring(layer_name, frontier_query)
-            count = self._serving_query_counts[layer_name]
-            destinations.append(ring[count % self.window_size])
-            sources.append(frontier_query)
+        self._serving_query_history.append(tuple(step_queries))
+        if len(self._serving_query_history) > self.window_size:
+            del self._serving_query_history[:-self.window_size]
 
-        torch._foreach_copy_(destinations, sources)
-        for layer_name in layer_order:
-            self._serving_query_counts[layer_name] += 1
+    def _serving_query_windows(self):
+        if len(self._serving_query_history) < self.window_size:
+            raise RuntimeError("R-KV does not have a full query window")
+        assert self._serving_layer_order is not None
+
+        num_layers = len(self._serving_layer_order)
+        flat_queries = [
+            step[layer_idx]
+            for layer_idx in range(num_layers)
+            for step in self._serving_query_history
+        ]
+        stacked = torch.stack(flat_queries, dim=0)
+        return (
+            stacked.view(num_layers, self.window_size, *stacked.shape[1:])
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .unsqueeze(1)
+        )
 
     def _serving_query_window(self, layer_name):
-        count = self._serving_query_counts.get(layer_name, 0)
-        if count < self.window_size:
-            raise RuntimeError(
-                f"R-KV does not have a full query window for {layer_name!r}"
-            )
-
-        ring = self._serving_query_rings[layer_name]
-        cursor = count % self.window_size
-        ordered = (
-            ring
-            if cursor == 0
-            else torch.cat((ring[cursor:], ring[:cursor]), dim=0)
-        )
-        return ordered.permute(1, 0, 2).unsqueeze(0).contiguous()
+        if self._serving_layer_order is None or layer_name not in self._serving_layer_order:
+            raise RuntimeError(f"R-KV has no query history for {layer_name!r}")
+        layer_idx = self._serving_layer_order.index(layer_name)
+        return self._serving_query_windows()[layer_idx]
 
     def select_kept_positions(
         self,
@@ -240,10 +231,11 @@ class R1KV:
         elif layer_order != self._serving_layer_order:
             raise RuntimeError("R-KV serving layer order changed across compactions")
 
+        query_windows = self._serving_query_windows()
         shared_scores = None
         kv_cache_len = None
-        for layer_name, key_states in layer_key_states.items():
-            query_states = self._serving_query_window(layer_name)
+        for layer_idx, (layer_name, key_states) in enumerate(layer_key_states.items()):
+            query_states = query_windows[layer_idx]
             if key_states.ndim != 4 or key_states.shape[0] != 1:
                 raise ValueError("R-KV serving selection expects one batched request")
             if kv_cache_len is None:
@@ -315,10 +307,7 @@ class R1KV:
 
         # Serving asks before the model forward. Count the observation that
         # this step will contribute without exposing R-KV readiness to callers.
-        observed_after_step = min(
-            self._serving_query_counts.values(),
-            default=0,
-        ) + int(
+        observed_after_step = len(self._serving_query_history) + int(
             self.should_observe_query(
                 num_decoded_tokens=num_decoded_tokens,
                 num_new_tokens=num_new_tokens,
