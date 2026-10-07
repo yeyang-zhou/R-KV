@@ -34,7 +34,8 @@ class R1KV:
 
         # Serving-only query history stays inside R-KV. The runtime forwards
         # request-local Q tensors but does not know R-KV's window semantics.
-        self._serving_query_history = {}
+        self._serving_query_rings = {}
+        self._serving_query_counts = {}
 
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
@@ -173,20 +174,38 @@ class R1KV:
             )
 
         # R-KV scores one decode-frontier query per observation step. Keep
-        # bounded copies here; materialize the ordered window only when scoring.
-        history = self._serving_query_history.setdefault(layer_name, [])
-        history.append(query[-1:].clone())
-        if len(history) > self.window_size:
-            del history[:-self.window_size]
+        # the ring here so serving runtimes never depend on window_size.
+        frontier_query = query[-1]
+        ring = self._serving_query_rings.get(layer_name)
+        if (
+            ring is None
+            or ring.shape[1] != frontier_query.shape[0]
+            or ring.shape[2] != frontier_query.shape[1]
+        ):
+            ring = frontier_query.new_empty(
+                (self.window_size, frontier_query.shape[0], frontier_query.shape[1])
+            )
+            self._serving_query_rings[layer_name] = ring
+            self._serving_query_counts[layer_name] = 0
+
+        count = self._serving_query_counts[layer_name]
+        ring[count % self.window_size].copy_(frontier_query)
+        self._serving_query_counts[layer_name] = count + 1
 
     def _serving_query_window(self, layer_name):
-        history = self._serving_query_history.get(layer_name, [])
-        if len(history) < self.window_size:
+        count = self._serving_query_counts.get(layer_name, 0)
+        if count < self.window_size:
             raise RuntimeError(
                 f"R-KV does not have a full query window for {layer_name!r}"
             )
 
-        ordered = torch.cat(history, dim=0)
+        ring = self._serving_query_rings[layer_name]
+        cursor = count % self.window_size
+        ordered = (
+            ring
+            if cursor == 0
+            else torch.cat((ring[cursor:], ring[:cursor]), dim=0)
+        )
         return ordered.permute(1, 0, 2).unsqueeze(0).contiguous()
 
     def select_kept_positions(
@@ -269,10 +288,7 @@ class R1KV:
     ):
         if not is_genuine_decode or num_new_tokens <= 0:
             return False
-        if min(
-            (len(history) for history in self._serving_query_history.values()),
-            default=0,
-        ) < self.window_size:
+        if min(self._serving_query_counts.values(), default=0) < self.window_size:
             return False
         if resident_len < self.budget + self.buffer:
             return False
