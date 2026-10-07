@@ -309,16 +309,20 @@ class R1KV:
         num_new_tokens,
         is_genuine_decode,
     ):
-        self._flush_serving_queries()
         if not is_genuine_decode or num_new_tokens <= 0:
-            return False
-        if min(self._serving_query_counts.values(), default=0) < self.window_size:
             return False
         if resident_len < self.budget + self.buffer:
             return False
-        return self._crosses_buffer_boundary(
+        if not self._crosses_buffer_boundary(
             num_decoded_tokens=num_decoded_tokens,
             num_new_tokens=num_new_tokens,
+        ):
+            return False
+
+        self._flush_serving_queries()
+        return (
+            min(self._serving_query_counts.values(), default=0)
+            >= self.window_size
         )
 
     def update_kv(
