@@ -37,7 +37,6 @@ class R1KV:
         self._serving_query_rings = {}
         self._serving_query_counts = {}
         self._serving_layer_order = None
-        self._pending_serving_queries = {}
 
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
@@ -182,52 +181,34 @@ class R1KV:
             self._serving_query_counts[layer_name] = 0
         return ring
 
-    def _flush_pending_serving_queries(self):
-        if not self._pending_serving_queries:
-            return
+    def observe_query(self, layer_queries: Mapping[str, torch.Tensor]):
+        """Record one request step of Q state for all serving layers."""
+        if not layer_queries:
+            raise ValueError("R-KV observation requires non-empty layer inputs")
+
+        layer_order = tuple(layer_queries)
         if self._serving_layer_order is None:
-            raise RuntimeError("R-KV query batching requires known serving layers")
-        if set(self._pending_serving_queries) != set(self._serving_layer_order):
-            raise RuntimeError("R-KV received an incomplete serving query layer set")
+            self._serving_layer_order = layer_order
+        elif layer_order != self._serving_layer_order:
+            raise RuntimeError("R-KV serving layer order changed across observations")
 
         destinations = []
         sources = []
-        for layer_name in self._serving_layer_order:
-            frontier_query = self._pending_serving_queries[layer_name]
+        for layer_name, query in layer_queries.items():
+            if query.ndim != 3 or query.shape[0] == 0:
+                raise ValueError(
+                    "R-KV observation expects [tokens, q_heads, head_dim]"
+                )
+
+            frontier_query = query[-1]
             ring = self._query_ring(layer_name, frontier_query)
             count = self._serving_query_counts[layer_name]
             destinations.append(ring[count % self.window_size])
             sources.append(frontier_query)
 
         torch._foreach_copy_(destinations, sources)
-        for layer_name in self._serving_layer_order:
+        for layer_name in layer_order:
             self._serving_query_counts[layer_name] += 1
-        self._pending_serving_queries.clear()
-
-    def observe_query(self, layer_name, query):
-        """Record the request-local Q state R-KV needs for its next decision."""
-        if query.ndim != 3 or query.shape[0] == 0:
-            raise ValueError(
-                "R-KV observation expects [tokens, q_heads, head_dim]"
-            )
-
-        frontier_query = query[-1]
-        if self._serving_layer_order is None:
-            ring = self._query_ring(layer_name, frontier_query)
-            count = self._serving_query_counts[layer_name]
-            ring[count % self.window_size].copy_(frontier_query)
-            self._serving_query_counts[layer_name] = count + 1
-            return
-
-        if layer_name not in self._serving_layer_order:
-            raise RuntimeError(f"Unexpected R-KV serving layer {layer_name!r}")
-        if layer_name in self._pending_serving_queries:
-            raise RuntimeError(
-                f"Duplicate R-KV query observation for layer {layer_name!r}"
-            )
-        self._pending_serving_queries[layer_name] = frontier_query
-        if len(self._pending_serving_queries) == len(self._serving_layer_order):
-            self._flush_pending_serving_queries()
 
     def _serving_query_window(self, layer_name):
         count = self._serving_query_counts.get(layer_name, 0)

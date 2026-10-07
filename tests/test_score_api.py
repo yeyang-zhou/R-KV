@@ -76,7 +76,7 @@ def test_query_history_is_owned_and_ordered_inside_rkv():
     policy = _policy(window=4)
     for step in range(6):
         query = torch.full((1, 2, 8), float(step))
-        policy.observe_query("layer", query)
+        policy.observe_query({"layer": query})
 
     actual = policy._serving_query_window("layer")
     assert actual.shape == (1, 2, 4, 8)
@@ -98,11 +98,12 @@ def test_select_kept_positions_owns_global_serving_selection():
         for name in layer_keys
     }
     for step in range(policy.window_size):
-        for name in layer_keys:
-            policy.observe_query(
-                name,
-                observed[name][:, :, step, :].permute(0, 1, 2),
-            )
+        policy.observe_query(
+            {
+                name: observed[name][:, :, step, :]
+                for name in layer_keys
+            }
+        )
 
     shared_scores = None
     for name, keys in layer_keys.items():
@@ -130,7 +131,7 @@ def test_select_kept_positions_matches_legacy_retained_set_single_head():
     values = torch.randn_like(keys)
 
     for step in range(policy.window_size):
-        policy.observe_query("layer", queries[:, :, step, :])
+        policy.observe_query({"layer": queries[:, :, step, :]})
 
     legacy_keys, _ = policy.update_kv(keys, queries, values)
     legacy_positions = []
@@ -205,7 +206,7 @@ def test_should_compact_owns_rkv_trigger_and_readiness():
 
     assert not policy.should_compact(num_decoded_tokens=128, **common)
     for _ in range(policy.window_size - 1):
-        policy.observe_query("layer", torch.randn(1, 4, 8))
+        policy.observe_query({"layer": torch.randn(1, 4, 8)})
 
     # Planning happens before the forward; the boundary step will contribute
     # the final observation needed by the R-KV window.
