@@ -32,6 +32,11 @@ class R1KV:
         if self.buffer < self.window_size:
             raise ValueError("buffer must be >= window_size")
 
+        # Serving-only query history stays inside R-KV. The runtime forwards
+        # request-local Q tensors but does not know R-KV's window semantics.
+        self._serving_query_history = []
+        self._serving_layer_order = None
+
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
         if self.record_kept_token_indices:
@@ -161,14 +166,104 @@ class R1KV:
         )
         return final_score, attn_weights
 
-    def score_kv(
+    def observe_query(self, layer_queries: Mapping[str, torch.Tensor]):
+        """Retain one request step of Q state for all serving layers."""
+        if not layer_queries:
+            raise ValueError("R-KV observation requires non-empty layer inputs")
+
+        layer_order = tuple(layer_queries)
+        if self._serving_layer_order is None:
+            self._serving_layer_order = layer_order
+        elif layer_order != self._serving_layer_order:
+            raise RuntimeError("R-KV serving layer order changed across observations")
+
+        step_queries = []
+        for query in layer_queries.values():
+            if query.ndim != 3 or query.shape[0] == 0:
+                raise ValueError(
+                    "R-KV observation expects [tokens, q_heads, head_dim]"
+                )
+            # LMCache forwards materialized request-local observations. Retain
+            # the frontier view and materialize the scoring window only when
+            # compaction actually needs it.
+            step_queries.append(query[-1])
+
+        self._serving_query_history.append(tuple(step_queries))
+        if len(self._serving_query_history) > self.window_size:
+            del self._serving_query_history[:-self.window_size]
+
+    def _serving_query_windows(self):
+        if len(self._serving_query_history) < self.window_size:
+            raise RuntimeError("R-KV does not have a full query window")
+        assert self._serving_layer_order is not None
+
+        num_layers = len(self._serving_layer_order)
+        flat_queries = [
+            step[layer_idx]
+            for layer_idx in range(num_layers)
+            for step in self._serving_query_history
+        ]
+        stacked = torch.stack(flat_queries, dim=0)
+        return (
+            stacked.view(num_layers, self.window_size, *stacked.shape[1:])
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .unsqueeze(1)
+        )
+
+    def _serving_query_window(self, layer_name):
+        if self._serving_layer_order is None or layer_name not in self._serving_layer_order:
+            raise RuntimeError(f"R-KV has no query history for {layer_name!r}")
+        layer_idx = self._serving_layer_order.index(layer_name)
+        return self._serving_query_windows()[layer_idx]
+
+    def select_kept_positions(
         self,
-        key_states,
-        query_states,
-    ):
-        """Return R-KV scores for past KV tokens without selecting or gathering."""
-        final_score, _ = self._compute_scores(key_states, query_states)
-        return final_score
+        layer_key_states: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Return one ordered retained-position set shared by all KV layers."""
+        if not layer_key_states:
+            raise ValueError("R-KV selection requires non-empty layer inputs")
+
+        layer_order = tuple(layer_key_states)
+        if self._serving_layer_order is None:
+            self._serving_layer_order = layer_order
+        elif layer_order != self._serving_layer_order:
+            raise RuntimeError("R-KV serving layer order changed across compactions")
+
+        query_windows = self._serving_query_windows()
+        shared_scores = None
+        kv_cache_len = None
+        for layer_idx, (layer_name, key_states) in enumerate(layer_key_states.items()):
+            query_states = query_windows[layer_idx]
+            if key_states.ndim != 4 or key_states.shape[0] != 1:
+                raise ValueError("R-KV serving selection expects one batched request")
+            if kv_cache_len is None:
+                kv_cache_len = int(key_states.shape[-2])
+            elif int(key_states.shape[-2]) != kv_cache_len:
+                raise ValueError("R-KV selection requires one shared KV length")
+
+            layer_score, _ = self._compute_scores(key_states, query_states)
+            layer_score = layer_score.mean(dim=1)[0]
+            shared_scores = (
+                layer_score if shared_scores is None else shared_scores + layer_score
+            )
+
+        assert shared_scores is not None
+        assert kv_cache_len is not None
+        if not torch.isfinite(shared_scores).all():
+            raise RuntimeError("R-KV computed non-finite scores; refusing to select")
+
+        past_idx = shared_scores.topk(
+            self.budget - self.window_size,
+            dim=-1,
+        ).indices
+        window_idx = torch.arange(
+            kv_cache_len - self.window_size,
+            kv_cache_len,
+            device=past_idx.device,
+        )
+        return torch.sort(torch.cat([past_idx, window_idx], dim=-1)).values
 
     def _crosses_buffer_boundary(
         self,
@@ -206,11 +301,20 @@ class R1KV:
         num_decoded_tokens,
         num_new_tokens,
         is_genuine_decode,
-        query_window_tokens,
     ):
         if not is_genuine_decode or num_new_tokens <= 0:
             return False
-        if query_window_tokens < self.window_size:
+
+        # Serving asks before the model forward. Count the observation that
+        # this step will contribute without exposing R-KV readiness to callers.
+        observed_after_step = len(self._serving_query_history) + int(
+            self.should_observe_query(
+                num_decoded_tokens=num_decoded_tokens,
+                num_new_tokens=num_new_tokens,
+                is_genuine_decode=is_genuine_decode,
+            )
+        )
+        if observed_after_step < self.window_size:
             return False
         if resident_len < self.budget + self.buffer:
             return False
