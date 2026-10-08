@@ -64,3 +64,18 @@ def cal_similarity(
 
     similarity_cos.scatter_(-1, similarity_retain.unsqueeze(-1), 0)
     return similarity_cos.mean(dim=-2).softmax(dim=-1)
+
+
+def aggregate_scores(layer_scores):
+    """Average scores across KV heads, then sum across layers for one request."""
+    if not layer_scores:
+        raise ValueError("Expected scores from at least one layer")
+    combined = None
+    for scores in layer_scores:
+        if scores.ndim != 3 or scores.shape[0] != 1:
+            raise ValueError("Expected per-layer scores of shape [1, kv_heads, tokens]")
+        layer_mean = scores.mean(dim=1)[0]
+        if combined is not None and layer_mean.shape != combined.shape:
+            raise ValueError("Layer scores must have matching token lengths")
+        combined = layer_mean if combined is None else combined + layer_mean
+    return combined
