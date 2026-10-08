@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import cal_similarity, compute_attention_scores
+from ..selection import aggregate_scores, select_kept_positions as select_positions
 
 
 class R1KV:
@@ -180,6 +181,39 @@ class R1KV:
         return self._crosses_buffer_boundary(
             num_decoded_tokens=num_decoded_tokens,
             num_new_tokens=num_new_tokens,
+        )
+
+    def select_kept_positions(
+        self,
+        layer_key_states: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Return one ordered retained-position set shared by all KV layers."""
+        if not layer_key_states:
+            raise ValueError("R-KV selection requires non-empty layer inputs")
+
+        layer_order = tuple(layer_key_states)
+        if self._serving_layer_order is None:
+            self._serving_layer_order = layer_order
+        elif layer_order != self._serving_layer_order:
+            raise RuntimeError("R-KV serving layer order changed across compactions")
+
+        query_windows = self._serving_query_windows()
+        layer_scores = []
+        kv_cache_len = None
+        for layer_idx, key_states in enumerate(layer_key_states.values()):
+            if key_states.ndim != 4 or key_states.shape[0] != 1:
+                raise ValueError("R-KV serving selection expects one batched request")
+            if kv_cache_len is None:
+                kv_cache_len = int(key_states.shape[-2])
+            elif int(key_states.shape[-2]) != kv_cache_len:
+                raise ValueError("R-KV selection requires one shared KV length")
+            layer_scores.append(self.score_kv(query_windows[layer_idx], key_states))
+
+        shared_scores = aggregate_scores(layer_scores)
+        if not torch.isfinite(shared_scores).all():
+            raise RuntimeError("R-KV computed non-finite scores; refusing to select")
+        return select_positions(
+            shared_scores, self.budget - self.window_size, self.window_size
         )
 
     def update_kv(
